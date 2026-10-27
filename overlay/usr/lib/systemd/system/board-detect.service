@@ -1,0 +1,14 @@
+[Unit]
+Description=Set persistent ethernet MAC and record CPUID
+Documentation=file:///usr/lib/scripts/board-detect.sh
+After=local-fs.target
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/scripts/board-detect.sh
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target

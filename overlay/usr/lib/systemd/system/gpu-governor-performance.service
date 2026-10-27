@@ -1,0 +1,9 @@
+[Unit]
+Description=Set GPU governor to performance
+
+[Service]
+ExecStart=/usr/lib/scripts/gpu-governor.sh
+Type=oneshot
+
+[Install]
+WantedBy=default.target
