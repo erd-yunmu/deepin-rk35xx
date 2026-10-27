@@ -130,6 +130,9 @@ EOF
 mkdir -p ${chroot_dir}/etc/apt/trusted.gpg.d
 cp -f ${keyring_root}/usr/share/keyrings/*.gpg ${chroot_dir}/etc/apt/trusted.gpg.d/
 
+# pam-auth-update warns when the hooks directory is missing
+mkdir -p ${chroot_dir}/etc/pam-auth-update/hooks
+
 # Mount the temporary API filesystems
 mkdir -p ${chroot_dir}/{proc,sys,run,dev,dev/pts}
 mount -t proc /proc ${chroot_dir}/proc
