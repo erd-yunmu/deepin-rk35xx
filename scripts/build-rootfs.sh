@@ -142,12 +142,6 @@ cat << 'CHROOT' | chroot ${chroot_dir} /bin/bash
 set -eE
 trap 'echo Error: in $0 on line $LINENO' ERR
 
-export LANGUAGE="zh_CN"
-export LANG="zh_CN.UTF-8"
-localedef -c -f UTF-8 -i zh_CN zh_CN.UTF-8
-locale-gen zh_CN.UTF-8
-update-locale LANG=zh_CN.UTF-8
-
 # Create User
 useradd -G sudo -m -s /bin/bash cat
 echo 'cat:temppwd' | chpasswd
@@ -188,6 +182,9 @@ apt-get -y update
 apt-get -y full-upgrade
 
 apt-get -y install ${packages_server}
+
+localedef -c -f UTF-8 -i zh_CN /usr/lib/locale/zh_CN.UTF-8
+update-locale LANG=zh_CN.UTF-8
 
 apt-get -y remove cryptsetup brltty 2> /dev/null || true
 
@@ -315,10 +312,8 @@ trap 'echo Error: in \$0 on line \$LINENO' ERR
 
 apt-get -y install ${packages_desktop}
 
-export LANGUAGE="zh_CN"
-export LANG="zh_CN.UTF-8"
-locale-gen zh_CN.UTF-8
-update-locale LANG="zh_CN.UTF-8"
+localedef -c -f UTF-8 -i zh_CN /usr/lib/locale/zh_CN.UTF-8
+update-locale LANG=zh_CN.UTF-8
 
 apt-get -y autoremove
 apt-get -y clean

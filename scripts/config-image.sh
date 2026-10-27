@@ -92,18 +92,21 @@ for type in $target; do
     chroot ${chroot_dir} /bin/bash -c "apt-mark hold $(echo "${uboot_package}" | sed -rn 's/(.*)_[[:digit:]].*/\1/p')"
 
     # Install the kernel
+    kernel_version="$(echo "${linux_image_package}" | sed -rn 's/linux-image-(.*)_[[:digit:]].*/\1/p')"
     cp "${linux_image_package}" "${linux_headers_package}" ${chroot_dir}/tmp/
     chroot ${chroot_dir} /bin/bash -c "dpkg -i /tmp/{${linux_image_package},${linux_headers_package}} && rm -rf /tmp/*"
-    chroot ${chroot_dir} /bin/bash -c "depmod -a $(echo "${linux_image_package}" | sed -rn 's/linux-image-(.*)_[[:digit:]].*/\1/p')"
-    # Make sure the initrd exists (deepin may not trigger it automatically)
-    chroot ${chroot_dir} /bin/bash -c "update-initramfs -c -k $(echo "${linux_image_package}" | sed -rn 's/linux-image-(.*)_[[:digit:]].*/\1/p')"
+    chroot ${chroot_dir} /bin/bash -c "depmod -a ${kernel_version}"
+    if [ ! -e "${chroot_dir}/boot/initrd.img-${kernel_version}" ]; then
+        chroot ${chroot_dir} /bin/bash -c "update-initramfs -c -k ${kernel_version}"
+    fi
     chroot ${chroot_dir} /bin/bash -c "apt-mark hold $(echo "${linux_image_package}" | sed -rn 's/(.*)_[[:digit:]].*/\1/p')"
     chroot ${chroot_dir} /bin/bash -c "apt-mark hold $(echo "${linux_headers_package}" | sed -rn 's/(.*)_[[:digit:]].*/\1/p')"
 
-    # Rebuild DKMS modules after the kernel is installed (e.g. deepin-anything)
+    # Rebuild DKMS modules for the installed kernel only (uname inside chroot
+    # reports the host kernel, so the version must be passed explicitly)
     if chroot ${chroot_dir} /bin/bash -c "command -v dkms > /dev/null"; then
-        chroot ${chroot_dir} /bin/bash -c "dkms autoinstall" || \
-            echo "Warning: dkms autoinstall failed, skipped"
+        chroot ${chroot_dir} /bin/bash -c "dkms autoinstall -k ${kernel_version}" || \
+            echo "Warning: dkms autoinstall failed for ${kernel_version}, skipped"
     fi
 
     # Install the camera engine (rkaiq) matching the board SoC
