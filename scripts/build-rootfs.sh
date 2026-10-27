@@ -214,7 +214,7 @@ install -D -m 0755 ${overlay_dir}/usr/lib/scripts/board-detect.sh ${chroot_dir}/
 install -D -m 0755 ${overlay_dir}/usr/lib/scripts/gpu-governor.sh ${chroot_dir}/usr/lib/scripts/gpu-governor.sh
 install -D -m 0755 ${overlay_dir}/usr/lib/scripts/alsa-audio-config ${chroot_dir}/usr/lib/scripts/alsa-audio-config
 
-for unit in cpu-governor-performance gpu-governor-performance board-detect \
+for unit in cpu-governor-performance board-detect \
             lubancat-mount-boot rtc-hym8563 alsa-audio-config; do
     install -D -m 0644 ${overlay_dir}/usr/lib/systemd/system/${unit}.service \
         ${chroot_dir}/usr/lib/systemd/system/${unit}.service
@@ -264,7 +264,7 @@ sed -i 's/^FSTYPE=auto/FSTYPE=ext4/' ${chroot_dir}/etc/initramfs-tools/initramfs
 
 # Serial console and performance governor services
 chroot ${chroot_dir} /bin/bash -c \
-    "systemctl enable cpu-governor-performance gpu-governor-performance board-detect lubancat-mount-boot rtc-hym8563 alsa-audio-config > /dev/null"
+    "systemctl enable cpu-governor-performance board-detect lubancat-mount-boot rtc-hym8563 alsa-audio-config > /dev/null"
 
 # Swapfile
 cat << 'CHROOT' | chroot ${chroot_dir} /bin/bash
@@ -301,10 +301,20 @@ mount -t sysfs /sys ${chroot_dir}/sys
 mount -o bind /dev ${chroot_dir}/dev
 mount -o bind /dev/pts ${chroot_dir}/dev/pts
 
-packages_desktop="xserver-xorg xinit deepin-desktop-environment-core"
+packages_desktop="xserver-xorg xinit deepin-desktop-environment-core \
+deepin-desktop-environment-base deepin-desktop-environment-cli \
+treeland-wayland-session ddm"
 if [[ ${DEEPIN_DESKTOP_EXTRAS:-0} == "1" ]]; then
     packages_desktop="${packages_desktop} deepin-desktop-environment-extras"
 fi
+
+# live-tools diverts update-initramfs and conflicts with deepin-immutable-ctl
+mkdir -p ${chroot_dir}/etc/apt/preferences.d
+cat > ${chroot_dir}/etc/apt/preferences.d/99-live-tools << 'EOF'
+Package: live-tools
+Pin: version *
+Pin-Priority: -1
+EOF
 
 cat << CHROOT | chroot ${chroot_dir} /bin/bash
 set -eE
@@ -320,9 +330,42 @@ apt-get -y clean
 apt-get -y autoclean
 CHROOT
 
-# Boot into the graphical target with lightdm
+# Mesa 26.2.3 (Panfrost / PanVK) built against deepin glibc 2.38
+cp ../packages/mesa/mesa-panfrost-panvk_*.deb ${chroot_dir}/tmp/
 chroot ${chroot_dir} /bin/bash -c \
-    "systemctl enable lightdm > /dev/null && systemctl set-default graphical.target > /dev/null"
+    "apt-get -y install /tmp/mesa-panfrost-panvk_*.deb && rm -f /tmp/mesa-panfrost-panvk_*.deb"
+
+cat ${overlay_dir}/etc/mesa-26.2.3.environment >> ${chroot_dir}/etc/environment
+
+# The compositor runs as a system service and does not read /etc/environment,
+# so give treeland the same mesa build as the user session
+mkdir -p ${chroot_dir}/etc/systemd/system/treeland.service.d
+cat > ${chroot_dir}/etc/systemd/system/treeland.service.d/mesa.conf << 'EOF'
+[Service]
+Environment="LD_LIBRARY_PATH=/opt/mesa-26.2.3/lib/aarch64-linux-gnu"
+Environment="LIBGL_DRIVERS_PATH=/opt/mesa-26.2.3/lib/aarch64-linux-gnu/dri"
+Environment="GBM_BACKENDS_PATH=/opt/mesa-26.2.3/lib/aarch64-linux-gnu/gbm"
+Environment="__EGL_VENDOR_LIBRARY_FILENAMES=/opt/mesa-26.2.3/share/glvnd/egl_vendor.d/50_mesa.json"
+Environment="LIBGL_DRIRC_PATH=/opt/mesa-26.2.3/share/drirc.d"
+Environment="VK_ICD_FILENAMES=/opt/mesa-26.2.3/share/vulkan/icd.d/panfrost_icd.aarch64.json"
+Environment="WLR_NO_HARDWARE_CURSORS=1"
+EOF
+
+# Allow local admin users to open the control center system page without a
+# password prompt (com.deepin.lastore.user-administration defaults to auth_admin)
+mkdir -p ${chroot_dir}/etc/polkit-1/rules.d
+cat > ${chroot_dir}/etc/polkit-1/rules.d/49-lastore-admin.rules << 'EOF'
+polkit.addRule(function(action, subject) {
+    if (action.id == "com.deepin.lastore.user-administration" &&
+        subject.local && subject.active && subject.isInGroup("sudo")) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+
+# Use ddm for Wayland (treeland) sessions instead of lightdm
+chroot ${chroot_dir} /bin/bash -c \
+    "systemctl disable lightdm > /dev/null 2>&1 || true; systemctl enable ddm > /dev/null; systemctl set-default graphical.target > /dev/null"
 
 # Rebuild initramfs (GPU/audio firmware)
 chroot ${chroot_dir} /bin/bash -c "update-initramfs -u"
