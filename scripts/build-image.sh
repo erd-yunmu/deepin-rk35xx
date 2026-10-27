@@ -154,26 +154,26 @@ cat > ${mount_point}/system-boot/boot.cmd << 'EOF'
 # mkimage -A arm64 -O linux -T script -C none -n "Boot Script" -d boot.cmd boot.scr
 
 setenv load_addr "${kernel_addr_r}"
-setenv ubuntu_env_size 0
+setenv distro_env_size 0
 
 echo "Boot script loaded from ${devtype} ${devnum}"
 
-# Board uEnv first; ubuntuEnv.txt only as fallback.
+# Board uEnv first; deepinEnv.txt only as fallback.
 if test -n "${lubancat_uenv}"; then
 	if test -e ${devtype} ${devnum}:${distro_bootpart} /uEnv/uEnv-${lubancat_uenv}.txt; then
 		load ${devtype} ${devnum}:${distro_bootpart} ${load_addr} /uEnv/uEnv-${lubancat_uenv}.txt
 		env import -t ${load_addr} ${filesize}
-		setenv ubuntu_env_size ${filesize}
+		setenv distro_env_size ${filesize}
 		echo "Config: /uEnv/uEnv-${lubancat_uenv}.txt"
 	fi
 fi
 
-if test "${ubuntu_env_size}" = "0"; then
-	if test -e ${devtype} ${devnum}:${distro_bootpart} /ubuntuEnv.txt; then
-		load ${devtype} ${devnum}:${distro_bootpart} ${load_addr} /ubuntuEnv.txt
+if test "${distro_env_size}" = "0"; then
+	if test -e ${devtype} ${devnum}:${distro_bootpart} /deepinEnv.txt; then
+		load ${devtype} ${devnum}:${distro_bootpart} ${load_addr} /deepinEnv.txt
 		env import -t ${load_addr} ${filesize}
-		setenv ubuntu_env_size ${filesize}
-		echo "Config: /ubuntuEnv.txt (fallback)"
+		setenv distro_env_size ${filesize}
+		echo "Config: /deepinEnv.txt (fallback)"
 	fi
 fi
 
@@ -202,7 +202,7 @@ printenv bootargs
 load ${devtype} ${devnum}:${distro_bootpart} ${fdt_addr_r} /dtbs/rockchip/${fdtfile}
 fdt addr ${fdt_addr_r} && fdt resize 0x40000
 
-if dtoverlay ${load_addr} ${ubuntu_env_size} ${devtype} ${devnum}:${distro_bootpart}; then
+if dtoverlay ${load_addr} ${distro_env_size} ${devtype} ${devnum}:${distro_bootpart}; then
     echo "Device tree overlays applied"
 else
     echo "Error applying device tree overlays, restoring original device tree"
@@ -274,11 +274,6 @@ if [ -f "${mount_point}/writable/usr/lib/u-boot/u-boot-rockchip.bin" ]; then
 else
     dd if="${mount_point}/writable/usr/lib/u-boot/idbloader.img" of="${loop}" seek=64 conv=notrunc
     dd if="${mount_point}/writable/usr/lib/u-boot/u-boot.itb" of="${loop}" seek=16384 conv=notrunc
-fi
-
-# Cloud init config for server image
-if [ -z "${img##*server*}" ]; then
-    cp ../overlay/boot/firmware/{meta-data,network-config} ${mount_point}/system-boot
 fi
 
 sync --file-system

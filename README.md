@@ -1,15 +1,15 @@
 # 概述
-面向 Rockchip RK3588 系列（LubanCat-4/5/5-V2/5IO）的 Ubuntu 体验，提供预制服务器版与桌面版镜像，开机即用。
+面向 Rockchip RK3588 系列（LubanCat-4/5/5-V2/5IO）的 deepin 25 构建工程，可生成服务器版与桌面版镜像。
 
 ## 主要特性
-- **系统**：Ubuntu 26.04（resolute）
+- **系统**：deepin 25（crimson）
 - **内核**：Linux 6.1.172（Rockchip BSP）
-- **桌面**：GNOME + GDM3，默认启用 Wayland 会话，内置中文语言包
-- **图形**：Mesa 26.2.3（Panfrost / PanVK），OpenGL ES 与 Vulkan 硬件加速
-- **视频**：Rockchip MPP 硬解；Chromium 流畅播放 4K YouTube，MPV / GStreamer 4K 播放
+- **桌面**：DDE（deepin-desktop-environment-core）+ lightdm，默认中文语言环境
+- **软件源**：华为云 deepin 镜像（可用 `DEEPIN_MIRROR` 覆盖）
+- **启动**：U-Boot + boot.scr 启动脚本，支持 SD / eMMC / NVMe
 
 # 获取与校验
-1. 从提供的下载源获取镜像（桌面/服务器版）。
+镜像由下方编译流程生成，产物同时附带 `.sha256` 校验文件。
 
 # 安装
 
@@ -25,7 +25,7 @@
 ## NVMe 启动
 - 方案 A（先从 SD 引导到系统后写 NVMe）：
   ```bash
-  xz -dc ubuntu-26.04-desktop-arm64-lubancat-5.img.xz | sudo dd of=/dev/nvme0n1 bs=4k
+  xz -dc deepin-25-desktop-arm64-lubancat-5.img.xz | sudo dd of=/dev/nvme0n1 bs=4k
   sync
   ```
   断电拔卡后，按 MR 进入 maskrom，将 `rkspi_loader_lubancat_5.img` 刷入 eMMC 作为 NVMe 引导。
@@ -36,7 +36,7 @@
   ```
 
 # 登录信息
-- 预设账户：用户 `cat` / 密码 `temppwd`
+- 预设账户：用户 `cat` / 密码 `temppwd`；`root` / 密码 `root`
 - 支持 HDMI 与串口登录。
 
 # 编译
@@ -44,23 +44,24 @@
 ## 安装依赖
 ```bash
 sudo apt-get install -y build-essential gcc-aarch64-linux-gnu bison \
-qemu-system-arm u-boot-tools binfmt-support python-is-python3 fdisk \
+qemu-user-static qemu-system-arm u-boot-tools binfmt-support python-is-python3 fdisk \
 debootstrap flex libssl-dev bc rsync kmod cpio xz-utils fakeroot parted \
-udev dosfstools uuid-runtime git-lfs device-tree-compiler python3 
+udev dosfstools uuid-runtime git-lfs device-tree-compiler python3
 
 ```
+
 ### 配置 ARM64 跨架构构建环境
 在 x86_64/amd64 主机上构建 ARM64 rootfs 前，需要启用 QEMU binfmt：
 ```bash
 sudo update-binfmts --enable qemu-aarch64
 update-binfmts --display qemu-aarch64
 ```
-确认输出中包含 `qemu-aarch64 (enabled)`构建脚本通过 binfmt 执行 ARM64 程序。
+确认输出中包含 `qemu-aarch64 (enabled)`，构建脚本通过 binfmt 执行 ARM64 程序。
 
 ## 获取源码
 ```bash
-git clone -b 26.04-panfrost https://github.com/erd-yunmu/ubuntu-ebf-rk3588
-cd ubuntu-ebf-rk3588
+git clone https://github.com/erd-yunmu/deepin-rk35xx
+cd deepin-rk35xx
 git lfs fetch && git lfs checkout
 ```
 
@@ -87,15 +88,17 @@ sudo ./build.sh config
 sudo ./build.sh all          # 全量构建：内核 + U-Boot + rootfs + 镜像
 sudo ./build.sh kernel       # 仅编译内核
 sudo ./build.sh uboot        # 仅编译 U-Boot
+sudo ./build.sh server       # 仅构建服务器版镜像
+sudo ./build.sh desktop      # 仅构建桌面版镜像
 sudo ./build.sh clean        # 删除 build 目录
 ```
 
 也可以跳过 `config`，直接指定板卡：
 ```bash
-sudo ./build.sh -b lubancat-4
+sudo ./build.sh -b lubancat-5
 ```
 
-常用命令（等价短选项写在同一行）：
+常用命令：
 
 | 命令 | 说明 |
 | --- | --- |
@@ -116,7 +119,9 @@ sudo ./build.sh -b lubancat-4
 错误：尚未配置目标板，请先执行: sudo ./build.sh config
 ```
 
-产物位于 `images/`。
+产物位于 `images/`，命名格式：
 
----
-Ubuntu is a trademark of Canonical Ltd. Rockchip is a trademark of Fuzhou Rockchip Electronics Co., Ltd. The Ubuntu Rockchip project is not affiliated with Canonical Ltd or Fuzhou Rockchip Electronics Co., Ltd. All other product names, logos, and brands are property of their respective owners. The Ubuntu name is owned by [Canonical Limited](https://ubuntu.com/).
+```
+deepin-25-{server,desktop}-arm64-<board>.img.xz
+deepin-25-{server,desktop}-arm64-<board>.img.xz.sha256
+```

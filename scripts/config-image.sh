@@ -16,6 +16,9 @@ if [[ -z ${BOARD} ]]; then
     exit 1
 fi
 
+# deepin 25 image prefix
+distro_prefix="deepin-25"
+
 uboot_deb_name="${UBOOT_DEB_NAME:-u-boot-${BOARD}}"
 uboot_package="$(basename "$(find "${uboot_deb_name}"_*.deb | sort | tail -n1)")"
 if [ ! -e "$uboot_package" ]; then
@@ -69,7 +72,7 @@ for type in $target; do
     rm -rf ${chroot_dir}
     mkdir -p ${chroot_dir}
 
-    tar -xpJf ubuntu-26.04-${type}-arm64.rootfs.tar.xz -C ${chroot_dir}
+    tar -xpJf ${distro_prefix}-${type}-arm64.rootfs.tar.xz -C ${chroot_dir}
 
     # Mount the temporary API filesystems
     mkdir -p ${chroot_dir}/{proc,sys,run,dev,dev/pts}
@@ -92,8 +95,16 @@ for type in $target; do
     cp "${linux_image_package}" "${linux_headers_package}" ${chroot_dir}/tmp/
     chroot ${chroot_dir} /bin/bash -c "dpkg -i /tmp/{${linux_image_package},${linux_headers_package}} && rm -rf /tmp/*"
     chroot ${chroot_dir} /bin/bash -c "depmod -a $(echo "${linux_image_package}" | sed -rn 's/linux-image-(.*)_[[:digit:]].*/\1/p')"
+    # Make sure the initrd exists (deepin may not trigger it automatically)
+    chroot ${chroot_dir} /bin/bash -c "update-initramfs -c -k $(echo "${linux_image_package}" | sed -rn 's/linux-image-(.*)_[[:digit:]].*/\1/p')"
     chroot ${chroot_dir} /bin/bash -c "apt-mark hold $(echo "${linux_image_package}" | sed -rn 's/(.*)_[[:digit:]].*/\1/p')"
     chroot ${chroot_dir} /bin/bash -c "apt-mark hold $(echo "${linux_headers_package}" | sed -rn 's/(.*)_[[:digit:]].*/\1/p')"
+
+    # Rebuild DKMS modules after the kernel is installed (e.g. deepin-anything)
+    if chroot ${chroot_dir} /bin/bash -c "command -v dkms > /dev/null"; then
+        chroot ${chroot_dir} /bin/bash -c "dkms autoinstall" || \
+            echo "Warning: dkms autoinstall failed, skipped"
+    fi
 
     # Install the camera engine (rkaiq) matching the board SoC
     cp "../packages/camera/${camera_package}" ${chroot_dir}/tmp/
@@ -112,15 +123,18 @@ for type in $target; do
     cp -r ${chroot_dir}/usr/lib/linux-image-*/. ${chroot_dir}/boot/firmware/dtbs/
 
     # Copy rockchip dedicated audio to system files
-    cp -r ${overlay_dir}/usr/share/alsa/* ${chroot_dir}/usr/share/alsa/
-    cp -r ${overlay_dir}/usr/share/pulseaudio/* ${chroot_dir}/usr/share/pulseaudio/
+    # Only copy the rockchip-* directories to keep the deepin ucm.conf untouched
+    mkdir -p ${chroot_dir}/usr/share/alsa/ucm2
+    for ucm_dir in ${overlay_dir}/usr/share/alsa/ucm2/rockchip-*; do
+        cp -r "${ucm_dir}" ${chroot_dir}/usr/share/alsa/ucm2/
+    done
 
     # Umount temporary API filesystems
     umount -lf ${chroot_dir}/dev/pts 2> /dev/null || true
     umount -lf ${chroot_dir}/* 2> /dev/null || true
 
     # Tar the entire rootfs
-    cd ${chroot_dir} && tar -cpf ../ubuntu-26.04-${type}-arm64-"${BOARD}".rootfs.tar . && cd ..
-    ../scripts/build-image.sh ubuntu-26.04-${type}-arm64-"${BOARD}".rootfs.tar
-    rm -f ubuntu-26.04-${type}-arm64-"${BOARD}".rootfs.tar
+    cd ${chroot_dir} && tar -cpf ../${distro_prefix}-${type}-arm64-"${BOARD}".rootfs.tar . && cd ..
+    ../scripts/build-image.sh ${distro_prefix}-${type}-arm64-"${BOARD}".rootfs.tar
+    rm -f ${distro_prefix}-${type}-arm64-"${BOARD}".rootfs.tar
 done

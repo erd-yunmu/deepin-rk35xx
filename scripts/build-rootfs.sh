@@ -1,9 +1,9 @@
 #!/bin/bash
 
-set -eE 
+set -eE
 trap 'echo Error: in $0 on line $LINENO' ERR
 
-if [ "$(id -u)" -ne 0 ]; then 
+if [ "$(id -u)" -ne 0 ]; then
     echo "Please run as root"
     exit 1
 fi
@@ -11,16 +11,19 @@ fi
 cd "$(dirname -- "$(readlink -f -- "$0")")" && cd ..
 mkdir -p build && cd build
 
+server_rootfs=deepin-25-server-arm64.rootfs.tar.xz
+desktop_rootfs=deepin-25-desktop-arm64.rootfs.tar.xz
+
 if [[ ${DESKTOP_ONLY} == "Y" ]]; then
-    if [[ -f ubuntu-26.04-desktop-arm64.rootfs.tar.xz ]]; then
+    if [[ -f ${desktop_rootfs} ]]; then
         exit 0
     fi
 elif [[ ${SERVER_ONLY} == "Y" ]]; then
-    if [[ -f ubuntu-26.04-server-arm64.rootfs.tar.xz ]]; then
+    if [[ -f ${server_rootfs} ]]; then
         exit 0
     fi
 else
-    if [[ -f ubuntu-26.04-server-arm64.rootfs.tar.xz && -f ubuntu-26.04-desktop-arm64.rootfs.tar.xz ]]; then
+    if [[ -f ${server_rootfs} && -f ${desktop_rootfs} ]]; then
         exit 0
     fi
 fi
@@ -33,12 +36,69 @@ unset TMPDIR
 # Prevent dpkg interactive dialogues
 export DEBIAN_FRONTEND=noninteractive
 
-# Debootstrap options
 arch=arm64
-release=resolute
-mirror=https://mirrors.huaweicloud.com/ubuntu-ports/
+release=crimson
+mirror="${DEEPIN_MIRROR:-https://mirrors.huaweicloud.com/deepin/beige}"
+mirror="${mirror%/}"
+components="main,commercial,community"
 chroot_dir=rootfs
 overlay_dir=../overlay
+
+# Fetch the deepin archive key (deepin-keyring) for Release verification
+keyring_root="$(pwd)/deepin-keyring"
+keyring_file="${keyring_root}/usr/share/keyrings/deepin-archive-crimson-keyring.gpg"
+
+if [[ ! -f ${keyring_file} ]]; then
+    echo "==> Fetching deepin-keyring"
+    rm -rf "${keyring_root}"
+    mkdir -p "${keyring_root}"
+
+    packages_index=deepin-Packages.xz
+    curl -fsSL -o "${packages_index}" \
+        "${mirror}/dists/${release}/main/binary-${arch}/Packages.xz"
+
+    keyring_deb_path="$(xz -dc "${packages_index}" \
+        | awk '/^Package: deepin-keyring$/{found=1} found && /^Filename:/{print $2; exit}')"
+    rm -f "${packages_index}"
+
+    if [[ -z ${keyring_deb_path} ]]; then
+        echo "Error: deepin-keyring not found in the deepin repository"
+        exit 1
+    fi
+
+    curl -fsSL -o deepin-keyring.deb "${mirror}/${keyring_deb_path}"
+    dpkg-deb -x deepin-keyring.deb "${keyring_root}"
+    rm -f deepin-keyring.deb
+fi
+
+if [[ ! -f ${keyring_file} ]]; then
+    echo "Error: failed to extract the deepin archive key: ${keyring_file}"
+    exit 1
+fi
+
+# Private debootstrap directory with the deepin suite script
+db_dir="$(pwd)/debootstrap"
+rm -rf "${db_dir}"
+cp -a /usr/share/debootstrap "${db_dir}"
+cat > "${db_dir}/scripts/crimson" << 'SUITE'
+# debootstrap suite for deepin 25 (crimson), based on Debian 13 rules
+mirror_style release
+download_style apt
+finddebs_style from-indices
+variants - buildd fakechroot minbase
+keyring /usr/share/keyrings/deepin-archive-crimson-keyring.gpg
+
+if [ -e "$DEBOOTSTRAP_DIR/scripts/debian-common" ]; then
+	. "$DEBOOTSTRAP_DIR/scripts/debian-common"
+elif [ -e /debootstrap/debian-common ]; then
+	. /debootstrap/debian-common
+elif [ -e "$DEBOOTSTRAP_DIR/debian-common" ]; then
+	. "$DEBOOTSTRAP_DIR/debian-common"
+else
+	error 1 NOCOMMON "File not found: debian-common"
+fi
+SUITE
+chmod 0644 "${db_dir}/scripts/crimson"
 
 # Clean chroot dir and make sure folder is not mounted
 umount -lf ${chroot_dir}/dev/pts 2> /dev/null || true
@@ -46,74 +106,29 @@ umount -lf ${chroot_dir}/* 2> /dev/null || true
 rm -rf ${chroot_dir}
 mkdir -p ${chroot_dir}
 
-# Detect current system architecture
-HOST_ARCH=$(uname -m)
+# arm64 binaries need binfmt on x86_64 hosts
+if [ "$(uname -m)" = "x86_64" ] &&
+   ! grep -q '^enabled' /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null; then
+    echo "ARM64 binfmt is not enabled. Install qemu-user-static and enable qemu-aarch64." >&2
+    exit 1
+fi
 
-case "${HOST_ARCH}" in
-    x86_64|amd64)
-        if [[ ! -r /proc/sys/fs/binfmt_misc/qemu-aarch64 ]] || 
-           ! grep -q '^enabled' /proc/sys/fs/binfmt_misc/qemu-aarch64; then
-            echo "ARM64 binfmt is not enabled. Install qemu-user-static and enable qemu-aarch64." >&2
-            exit 1
-        fi
-        echo "Detected x86_64 architecture, using binfmt/QEMU"
-        debootstrap --no-merged-usr --arch="${arch}" "${release}" "${chroot_dir}" "${mirror}"
-        ;;
-    aarch64|arm64)
-        echo "Detected ARM64 architecture, using native debootstrap"
-        debootstrap --no-merged-usr --arch="${arch}" "${release}" "${chroot_dir}" "${mirror}"
-        ;;
-    *)
-        echo "Unsupported host architecture: ${HOST_ARCH}" >&2
-        exit 1
-        ;;
-esac
+DEBOOTSTRAP_DIR="${db_dir}" debootstrap \
+    --arch="${arch}" \
+    --keyring="${keyring_file}" \
+    --components="${components}" \
+    "${release}" "${chroot_dir}" "${mirror}/"
 
-# Use a more complete sources.list file 
-cat > ${chroot_dir}/etc/apt/sources.list << EOF
-# See http://help.ubuntu.com/community/UpgradeNotes for how to upgrade to
-# newer versions of the distribution.
-deb ${mirror} ${release} main restricted
-# deb-src ${mirror} ${release} main restricted
-
-## Major bug fix updates produced after the final release of the
-## distribution.
-deb ${mirror} ${release}-updates main restricted
-# deb-src ${mirror} ${release}-updates main restricted
-
-## N.B. software from this repository is ENTIRELY UNSUPPORTED by the Ubuntu
-## team. Also, please note that software in universe WILL NOT receive any
-## review or updates from the Ubuntu security team.
-deb ${mirror} ${release} universe
-# deb-src ${mirror} ${release} universe
-deb ${mirror} ${release}-updates universe
-# deb-src ${mirror} ${release}-updates universe
-
-## N.B. software from this repository is ENTIRELY UNSUPPORTED by the Ubuntu
-## team, and may not be under a free licence. Please satisfy yourself as to
-## your rights to use the software. Also, please note that software in
-## multiverse WILL NOT receive any review or updates from the Ubuntu
-## security team.
-deb ${mirror} ${release} multiverse
-# deb-src ${mirror} ${release} multiverse
-deb ${mirror} ${release}-updates multiverse
-# deb-src ${mirror} ${release}-updates multiverse
-
-## N.B. software from this repository may not have been tested as
-## extensively as that contained in the main release, although it includes
-## newer versions of some applications which may provide useful features.
-## Also, please note that software in backports WILL NOT receive any review
-## or updates from the Ubuntu security team.
-deb ${mirror} ${release}-backports main restricted universe multiverse
-# deb-src ${mirror} ${release}-backports main restricted universe multiverse
-
-deb ${mirror} ${release}-security main restricted
-# deb-src ${mirror} ${release}-security main restricted
-deb ${mirror} ${release}-security universe
-# deb-src ${mirror} ${release}-security universe
-deb ${mirror} ${release}-security multiverse
-# deb-src ${mirror} ${release}-security multiverse
+# deepin has a single rolling repository, no -updates/-security suites
+rm -f ${chroot_dir}/etc/apt/sources.list
+mkdir -p ${chroot_dir}/etc/apt/sources.list.d
+cat > ${chroot_dir}/etc/apt/sources.list.d/deepin.list << EOF
+deb ${mirror}/ ${release} main commercial community
 EOF
+
+# Install the deepin archive keys into the rootfs for apt
+mkdir -p ${chroot_dir}/etc/apt/trusted.gpg.d
+cp -f ${keyring_root}/usr/share/keyrings/*.gpg ${chroot_dir}/etc/apt/trusted.gpg.d/
 
 # Mount the temporary API filesystems
 mkdir -p ${chroot_dir}/{proc,sys,run,dev,dev/pts}
@@ -122,12 +137,10 @@ mount -t sysfs /sys ${chroot_dir}/sys
 mount -o bind /dev ${chroot_dir}/dev
 mount -o bind /dev/pts ${chroot_dir}/dev/pts
 
-# Download and update packages
-cat << EOF | chroot ${chroot_dir} /bin/bash
-set -eE 
+# Base system configuration
+cat << 'CHROOT' | chroot ${chroot_dir} /bin/bash
+set -eE
 trap 'echo Error: in $0 on line $LINENO' ERR
-
-# Update localisation files
 
 export LANGUAGE="zh_CN"
 export LANG="zh_CN.UTF-8"
@@ -135,20 +148,12 @@ localedef -c -f UTF-8 -i zh_CN zh_CN.UTF-8
 locale-gen zh_CN.UTF-8
 update-locale LANG=zh_CN.UTF-8
 
-HOST=lubancat
-
 # Create User
 useradd -G sudo -m -s /bin/bash cat
-passwd cat <<IEOF
-temppwd
-temppwd
-IEOF
-gpasswd -a cat video
-gpasswd -a cat audio
-passwd root <<IEOF
-root
-root
-IEOF
+echo 'cat:temppwd' | chpasswd
+groupadd -r render 2> /dev/null || true
+usermod -aG video,audio,render cat
+echo 'root:root' | chpasswd
 
 # allow root login
 sed -i '/pam_securetty.so/s/^/# /g' /etc/pam.d/login
@@ -158,161 +163,123 @@ echo lubancat > /etc/hostname
 
 # set localtime
 ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+echo 'Asia/Shanghai' > /etc/timezone
+CHROOT
 
-# Download and update installed packages
-apt-get -y update && apt-get -y upgrade && apt-get -y dist-upgrade
+if [[ -f ${overlay_dir}/etc/resolv.conf ]]; then
+    cp ${overlay_dir}/etc/resolv.conf ${chroot_dir}/etc/resolv.conf
+fi
 
-# Download and install generic packages
-apt-get -y install dmidecode mtd-tools i2c-tools u-boot-tools linux-firmware \
-bash-completion man-db manpages nano gnupg initramfs-tools python3-dev tree \
-ubuntu-drivers-common ubuntu-server dosfstools mtools parted ntfs-3g zip atop \
-p7zip-full htop iotop pciutils lshw lsof landscape-common exfat-fuse hwinfo \
-net-tools openssh-client openssh-server wpasupplicant ifupdown \
-pigz wget curl lm-sensors bluez gdisk usb-modeswitch usb-modeswitch-data make \
-gcc libc6-dev bison libssl-dev flex fake-hwclock rfkill wireless-regdb mmc-utils \
-network-manager python3-opencv python3-pip python3-numpy python3-venv pulseaudio \
-cloud-initramfs-growroot
+# Install base packages
+packages_server="dmidecode i2c-tools linux-firmware bash-completion man-db nano gnupg \
+initramfs-tools tree dosfstools mtools parted ntfs-3g exfat-fuse zip htop pciutils \
+lshw lsof hwinfo net-tools openssh-client openssh-server wpasupplicant network-manager \
+pigz wget curl lm-sensors bluez gdisk usb-modeswitch usb-modeswitch-data make gcc \
+libc6-dev bison libssl-dev flex bc rfkill wireless-regdb python3 python3-pip \
+python3-numpy python3-venv cloud-guest-utils kmod usbutils sudo locales \
+console-setup systemd-timesyncd ca-certificates dkms device-tree-compiler libdrm2 \
+cloud-initramfs-growroot"
 
-# Update upgrade
+cat << CHROOT | chroot ${chroot_dir} /bin/bash
+set -eE
+trap 'echo Error: in \$0 on line \$LINENO' ERR
+
+apt-get -y update
 apt-get -y full-upgrade
 
-# Remove cryptsetup and needrestart
-apt-get -y remove cryptsetup needrestart brltty
+apt-get -y install ${packages_server}
 
-# Clean package cache
-apt-get -y autoremove && apt-get -y clean
-EOF
+apt-get -y remove cryptsetup brltty 2> /dev/null || true
+
+apt-get -y autoremove
+apt-get -y clean
+CHROOT
+
+# Optional Rockchip multimedia debs, disabled by default
+if [[ ${DEEPIN_INSTALL_ROCKCHIP_DEBS:-0} == "1" ]]; then
+    echo "==> Installing Rockchip multimedia debs"
+    mkdir -p ${chroot_dir}/tmp/rockchip-debs
+    find ../packages/arm64/ -maxdepth 1 -type f -name "*.deb" \
+        -exec cp -f {} ${chroot_dir}/tmp/rockchip-debs/ \;
+    set +e
+    chroot ${chroot_dir} /bin/bash -c \
+        "apt-get -y install /tmp/rockchip-debs/*.deb" && rc=0 || rc=$?
+    set -e
+    if [[ ${rc} -ne 0 ]]; then
+        echo "Warning: Rockchip multimedia debs failed (rc=${rc}), skipped"
+        chroot ${chroot_dir} /bin/bash -c "dpkg --configure -a > /dev/null 2>&1 || true"
+    fi
+    rm -rf ${chroot_dir}/tmp/rockchip-debs
+fi
+
+# Hardware overlay (distro independent parts only)
+install -D -m 0755 ${overlay_dir}/usr/lib/scripts/board-detect.sh ${chroot_dir}/usr/lib/scripts/board-detect.sh
+install -D -m 0755 ${overlay_dir}/usr/lib/scripts/gpu-governor.sh ${chroot_dir}/usr/lib/scripts/gpu-governor.sh
+install -D -m 0755 ${overlay_dir}/usr/lib/scripts/alsa-audio-config ${chroot_dir}/usr/lib/scripts/alsa-audio-config
+
+for unit in cpu-governor-performance gpu-governor-performance board-detect \
+            lubancat-mount-boot rtc-hym8563 alsa-audio-config; do
+    install -D -m 0644 ${overlay_dir}/usr/lib/systemd/system/${unit}.service \
+        ${chroot_dir}/usr/lib/systemd/system/${unit}.service
+done
+
+install -D -m 0755 ${overlay_dir}/usr/local/sbin/lubancat-mount-boot ${chroot_dir}/usr/local/sbin/lubancat-mount-boot
+install -D -m 0755 ${overlay_dir}/usr/local/bin/mac-lookup ${chroot_dir}/usr/local/bin/mac-lookup
+install -D -m 0755 ${overlay_dir}/usr/local/bin/ebf-config ${chroot_dir}/usr/local/bin/ebf-config
+install -D -m 0644 ${overlay_dir}/etc/mac-lookup/ids.txt ${chroot_dir}/etc/mac-lookup/ids.txt
+
+# Serial console and logs
+install -D -m 0644 ${overlay_dir}/etc/profile.d/resize.sh ${chroot_dir}/etc/profile.d/resize.sh
+install -D -m 0644 ${overlay_dir}/usr/lib/systemd/system/serial-getty@.service.d/10-term.conf \
+    ${chroot_dir}/lib/systemd/system/serial-getty@.service.d/10-term.conf
+install -D -m 0644 ${overlay_dir}/etc/systemd/journald.conf.d/console.conf \
+    ${chroot_dir}/etc/systemd/journald.conf.d/console.conf
+
+# Network
+install -D -m 0644 ${overlay_dir}/etc/udev/rules.d/80-net-setup-link.rules \
+    ${chroot_dir}/etc/udev/rules.d/80-net-setup-link.rules
+install -D -m 0644 ${overlay_dir}/usr/lib/NetworkManager/conf.d/10-override-wifi-random-mac-disable.conf \
+    ${chroot_dir}/etc/NetworkManager/conf.d/10-override-wifi-random-mac-disable.conf
+install -D -m 0644 ${overlay_dir}/usr/lib/NetworkManager/conf.d/20-override-wifi-powersave-disable.conf \
+    ${chroot_dir}/etc/NetworkManager/conf.d/20-override-wifi-powersave-disable.conf
+
+# initramfs
+install -D -m 0644 ${overlay_dir}/etc/initramfs-tools/conf.d/compression.conf \
+    ${chroot_dir}/etc/initramfs-tools/conf.d/compression.conf
+install -D -m 0644 ${overlay_dir}/etc/initramfs-tools/conf-hooks.d/plymouth \
+    ${chroot_dir}/etc/initramfs-tools/conf-hooks.d/plymouth
+install -D -m 0755 ${overlay_dir}/etc/initramfs/post-update.d/zz-update-firmware \
+    ${chroot_dir}/etc/initramfs/post-update.d/zz-update-firmware
+install -D -m 0755 ${overlay_dir}/usr/share/initramfs-tools/hooks/usb_modeswitch \
+    ${chroot_dir}/usr/share/initramfs-tools/hooks/usb_modeswitch
+install -D -m 0755 ${overlay_dir}/usr/share/initramfs-tools/hooks/rtl-bt \
+    ${chroot_dir}/usr/share/initramfs-tools/hooks/rtl-bt
+
+# Rockchip audio UCM: copy only the rockchip-* directories so the deepin ucm.conf
+# is not overwritten
+mkdir -p ${chroot_dir}/usr/share/alsa/ucm2
+for ucm_dir in ${overlay_dir}/usr/share/alsa/ucm2/rockchip-*; do
+    cp -r "${ucm_dir}" ${chroot_dir}/usr/share/alsa/ucm2/
+done
+
+# Use ext4 for the root partition
+sed -i 's/^FSTYPE=auto/FSTYPE=ext4/' ${chroot_dir}/etc/initramfs-tools/initramfs.conf 2> /dev/null || true
+
+# Serial console and performance governor services
+chroot ${chroot_dir} /bin/bash -c \
+    "systemctl enable cpu-governor-performance gpu-governor-performance board-detect lubancat-mount-boot rtc-hym8563 alsa-audio-config > /dev/null"
 
 # Swapfile
-cat << EOF | chroot ${chroot_dir} /bin/bash
-set -eE 
+cat << 'CHROOT' | chroot ${chroot_dir} /bin/bash
+set -eE
 trap 'echo Error: in $0 on line $LINENO' ERR
-
 dd if=/dev/zero of=/tmp/swapfile bs=1024 count=2097152
 chmod 600 /tmp/swapfile
 mkswap /tmp/swapfile
 mv /tmp/swapfile /swapfile
-EOF
+CHROOT
 
-# Install arm64 deb package
-mkdir -p ${chroot_dir}/tmp
-find ../packages/arm64/ -type f -name "*.deb" -exec cp -f {} ${chroot_dir}/tmp/ \;
-chroot ${chroot_dir} /bin/bash -c "apt install -y libglib2.0-dev libunwind-dev libdw-dev liblzma-doc"
-chroot ${chroot_dir} /bin/bash -c "dpkg -i /tmp/*.deb"
-chroot ${chroot_dir} /bin/bash -c "apt-mark hold ffmpeg && apt -y --fix-broken install"
-rm -f ${chroot_dir}/tmp/*.deb
-
-# Customize header content
-cp ${overlay_dir}/etc/update-motd.d/{00-header,30-sysinfo} ${chroot_dir}/etc/update-motd.d
-
-# DNS
-cp ${overlay_dir}/etc/resolv.conf ${chroot_dir}/etc/resolv.conf
-
-# Hosts file
-cp ${overlay_dir}/etc/hosts ${chroot_dir}/etc/hosts
-
-# Serial console resize script
-cp ${overlay_dir}/etc/profile.d/resize.sh ${chroot_dir}/etc/profile.d/resize.sh
-
-# Enable rc-local
-cp ${overlay_dir}/etc/rc.local ${chroot_dir}/etc/rc.local
-
-# Default adduser config
-cp ${overlay_dir}/etc/adduser.conf ${chroot_dir}/etc/adduser.conf
-
-mkdir -p ${chroot_dir}/etc/initramfs/post-update.d/
-cp ${overlay_dir}/etc/initramfs/post-update.d/zz-update-firmware ${chroot_dir}/etc/initramfs/post-update.d/zz-update-firmware
-
-# Install filesystem checks for the root and ext4 boot partitions
-cp ${overlay_dir}/usr/share/initramfs-tools/scripts/functions ${chroot_dir}/usr/share/initramfs-tools/scripts/functions
-cp ${overlay_dir}/usr/share/initramfs-tools/hooks/fsck-ext4 ${chroot_dir}/usr/share/initramfs-tools/hooks/fsck-ext4
-mkdir -p ${chroot_dir}/usr/share/initramfs-tools/scripts/local-bottom
-cp ${overlay_dir}/usr/share/initramfs-tools/scripts/local-bottom/fsck-boot-firmware ${chroot_dir}/usr/share/initramfs-tools/scripts/local-bottom/fsck-boot-firmware
-chmod 0755 ${chroot_dir}/usr/share/initramfs-tools/hooks/fsck-ext4 \
-    ${chroot_dir}/usr/share/initramfs-tools/scripts/local-bottom/fsck-boot-firmware
-sed -i 's/^FSTYPE=auto/FSTYPE=ext4/' ${chroot_dir}/etc/initramfs-tools/initramfs.conf
-
-# Realtek 8811CU/8821CU usb modeswitch support
-cp ${chroot_dir}/lib/udev/rules.d/40-usb_modeswitch.rules ${chroot_dir}/etc/udev/rules.d/40-usb_modeswitch.rules
-sed '/LABEL="modeswitch_rules_end"/d' -i ${chroot_dir}/etc/udev/rules.d/40-usb_modeswitch.rules
-cat >> ${chroot_dir}/etc/udev/rules.d/40-usb_modeswitch.rules <<EOF
-# Realtek 8811CU/8821CU Wifi AC USB
-ATTR{idVendor}=="0bda", ATTR{idProduct}=="1a2b", RUN+="/usr/sbin/usb_modeswitch -K -v 0bda -p 1a2b"
-
-LABEL="modeswitch_rules_end"
-EOF
-
-# Add usb modeswitch to initrd this fixes a boot hang with 8811CU/8821CU
-cp ${overlay_dir}/usr/share/initramfs-tools/hooks/usb_modeswitch ${chroot_dir}/usr/share/initramfs-tools/hooks/usb_modeswitch
-
-# Set cpu governor to performance
-cp ${overlay_dir}/usr/lib/systemd/system/cpu-governor-performance.service ${chroot_dir}/usr/lib/systemd/system/cpu-governor-performance.service
-chroot ${chroot_dir} /bin/bash -c "systemctl enable cpu-governor-performance"
-
-# Set gpu governor to performance
-mkdir -p ${chroot_dir}/usr/lib/scripts
-cp ${overlay_dir}/usr/lib/scripts/gpu-governor.sh ${chroot_dir}/usr/lib/scripts/gpu-governor.sh
-chmod +x ${chroot_dir}/usr/lib/scripts/gpu-governor.sh
-cp ${overlay_dir}/usr/lib/systemd/system/gpu-governor-performance.service ${chroot_dir}/usr/lib/systemd/system/gpu-governor-performance.service
-chroot ${chroot_dir} /bin/bash -c "systemctl enable gpu-governor-performance"
-
-cp ${overlay_dir}/usr/lib/scripts/board-detect.sh ${chroot_dir}/usr/lib/scripts/board-detect.sh
-chmod +x ${chroot_dir}/usr/lib/scripts/board-detect.sh
-cp ${overlay_dir}/usr/lib/systemd/system/board-detect.service ${chroot_dir}/usr/lib/systemd/system/board-detect.service
-chroot ${chroot_dir} /bin/bash -c "systemctl enable board-detect"
-
-mkdir -p ${chroot_dir}/usr/local/sbin
-cp ${overlay_dir}/usr/local/sbin/lubancat-mount-boot ${chroot_dir}/usr/local/sbin/lubancat-mount-boot
-chmod 0755 ${chroot_dir}/usr/local/sbin/lubancat-mount-boot
-cp ${overlay_dir}/usr/lib/systemd/system/lubancat-mount-boot.service ${chroot_dir}/usr/lib/systemd/system/lubancat-mount-boot.service
-chroot ${chroot_dir} /bin/bash -c "systemctl enable lubancat-mount-boot"
-
-mkdir -p ${chroot_dir}/usr/local/bin ${chroot_dir}/etc/mac-lookup
-cp ${overlay_dir}/usr/local/bin/mac-lookup ${chroot_dir}/usr/local/bin/mac-lookup
-chmod +x ${chroot_dir}/usr/local/bin/mac-lookup
-cp ${overlay_dir}/usr/local/bin/ebf-config ${chroot_dir}/usr/local/bin/ebf-config
-chmod +x ${chroot_dir}/usr/local/bin/ebf-config
-cp ${overlay_dir}/etc/mac-lookup/ids.txt ${chroot_dir}/etc/mac-lookup/ids.txt
-
-# Add realtek bluetooth firmware to initrd 
-cp ${overlay_dir}/usr/share/initramfs-tools/hooks/rtl-bt ${chroot_dir}/usr/share/initramfs-tools/hooks/rtl-bt
-
-# Service to synchronise system clock to hardware RTC
-cp ${overlay_dir}/usr/lib/systemd/system/rtc-hym8563.service ${chroot_dir}/usr/lib/systemd/system/rtc-hym8563.service
-
-# Modify service timeout
-cp ${overlay_dir}/usr/lib/systemd/system/NetworkManager-wait-online.service ${chroot_dir}/usr/lib/systemd/system/NetworkManager-wait-online.service
-
-# Set term for serial tty
-mkdir -p ${chroot_dir}/lib/systemd/system/serial-getty@.service.d/
-cp ${overlay_dir}/usr/lib/systemd/system/serial-getty@.service.d/10-term.conf ${chroot_dir}/lib/systemd/system/serial-getty@.service.d/10-term.conf
-
-# Forward the systemd journal to the serial console
-mkdir -p ${chroot_dir}/etc/systemd/journald.conf.d
-cp ${overlay_dir}/etc/systemd/journald.conf.d/console.conf ${chroot_dir}/etc/systemd/journald.conf.d/console.conf
-
-# Fix 120 second timeout bug
-mkdir -p ${chroot_dir}/etc/systemd/system/systemd-networkd-wait-online.service.d/
-cp ${overlay_dir}/etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf ${chroot_dir}/etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
-
-# Fix network management not being taken over
-cp ${overlay_dir}/etc/netplan/01-network-manager-all.yaml ${chroot_dir}/etc/netplan/01-network-manager-all.yaml
-
-# Fix the problem of network interface order change
-cp ${overlay_dir}/etc/udev/rules.d/80-net-setup-link.rules ${chroot_dir}/etc/udev/rules.d/80-net-setup-link.rules
-
-# Use gzip compression for the initrd
-cp ${overlay_dir}/etc/initramfs-tools/conf.d/compression.conf ${chroot_dir}/etc/initramfs-tools/conf.d/compression.conf
-
-# Disable terminal ads
-sed -i 's/ENABLED=1/ENABLED=0/g' ${chroot_dir}/etc/default/motd-news
-chroot ${chroot_dir} /bin/bash -c "pro config set apt_news=false"
-
-# Remove release upgrade motd
-rm -f ${chroot_dir}/var/lib/ubuntu-release-upgrader/release-upgrade-available
-cp ${overlay_dir}/etc/update-manager/release-upgrades ${chroot_dir}/etc/update-manager/release-upgrades
-
-# Let systemd create machine id on first boot
+# Let systemd generate the machine-id on first boot
 rm -f ${chroot_dir}/var/lib/dbus/machine-id
 true > ${chroot_dir}/etc/machine-id
 
@@ -320,151 +287,60 @@ true > ${chroot_dir}/etc/machine-id
 umount -lf ${chroot_dir}/dev/pts 2> /dev/null || true
 umount -lf ${chroot_dir}/* 2> /dev/null || true
 
-# Tar the entire rootfs
-[[ ${DESKTOP_ONLY} != "Y" ]] && cd ${chroot_dir} && XZ_OPT="-3 -T0" tar -cpJf ../ubuntu-26.04-server-arm64.rootfs.tar.xz . && cd ..
-[[ ${SERVER_ONLY} == "Y" ]] && exit 0
+# Tar the server rootfs
+if [[ ${DESKTOP_ONLY} != "Y" ]]; then
+    echo "==> Packing ${server_rootfs}"
+    cd ${chroot_dir} && XZ_OPT="-3 -T0" tar -cpJf ../${server_rootfs} . && cd ..
+fi
 
-# Mount the temporary API filesystems
+if [[ ${SERVER_ONLY} == "Y" ]]; then
+    exit 0
+fi
+
+# Desktop: DDE
 mkdir -p ${chroot_dir}/{proc,sys,run,dev,dev/pts}
 mount -t proc /proc ${chroot_dir}/proc
 mount -t sysfs /sys ${chroot_dir}/sys
 mount -o bind /dev ${chroot_dir}/dev
 mount -o bind /dev/pts ${chroot_dir}/dev/pts
 
-# Copy Chromium RKMPP local packages into the desktop chroot
-chromium_rkmpp_package_dir=../packages/chromium-rkmpp-deb-bundle
-chromium_rkmpp_chroot_dir=${chroot_dir}/tmp/chromium-rkmpp-deb-bundle
-mkdir -p ${chromium_rkmpp_chroot_dir}
-find ${chromium_rkmpp_package_dir}/ -maxdepth 1 -type f -name "*.deb" \
-    -exec cp -f {} ${chromium_rkmpp_chroot_dir}/ \;
+packages_desktop="xserver-xorg xinit deepin-desktop-environment-core"
+if [[ ${DEEPIN_DESKTOP_EXTRAS:-0} == "1" ]]; then
+    packages_desktop="${packages_desktop} deepin-desktop-environment-extras"
+fi
 
-# Copy the isolated Mesa package into the desktop chroot
-cp ../packages/mesa/*.deb ${chroot_dir}/tmp/
+cat << CHROOT | chroot ${chroot_dir} /bin/bash
+set -eE
+trap 'echo Error: in \$0 on line \$LINENO' ERR
 
-# Download and update packages
-cat << EOF | chroot ${chroot_dir} /bin/bash
-set -eE 
-trap 'echo Error: in $0 on line $LINENO' ERR
-
-# Desktop packages
-apt-get -y install ubuntu-desktop dbus-x11 xterm pulseaudio pavucontrol qtwayland5 \
-gstreamer1.0-plugins-bad gstreamer1.0-plugins-base gstreamer1.0-plugins-good mpv \
-gstreamer1.0-tools mesa-utils libcanberra-pulse ir-keytable dvb-tools gnome-software \
-rist-tools libdvbv5-dev libdvbv5-doc libv4l-0 libv4l2rds0 libv4lconvert0 libv4l-dev \
-qv4l2 v4l-utils libegl-mesa0 libegl1-mesa-dev libgbm-dev guvcview librist4 librist-dev \
-libgl1-mesa-dev libgles2-mesa-dev libglx-mesa0 mesa-common-dev mesa-vulkan-drivers \
-language-pack-zh-han*
-
-# Install Mesa 26.2.3 and resolve its runtime dependencies from Resolute
-apt-get -y install /tmp/mesa-panfrost-panvk-26.2.3-ubuntu26.04-arm64.deb
-rm -f /tmp/mesa-panfrost-panvk-26.2.3-ubuntu26.04-arm64.deb
-getent group render > /dev/null || groupadd --system render
-usermod -aG render cat
+apt-get -y install ${packages_desktop}
 
 export LANGUAGE="zh_CN"
 export LANG="zh_CN.UTF-8"
-localedef -c -f UTF-8 -i zh_CN zh_CN.UTF-8
 locale-gen zh_CN.UTF-8
 update-locale LANG="zh_CN.UTF-8"
 
-# Install the zh_CN language support package
-apt-get -y install thunderbird-locale-zh-hant ibus-table-cangjie5 \
-libreoffice-l10n-zh-cn libreoffice-help-zh-tw ibus-libpinyin \
-language-pack-gnome-zh-hans ibus-table-wubi ibus-table-cangjie3 \
-gnome-user-docs-zh-hans fonts-arphic-ukai thunderbird-locale-zh-hans \
-fonts-arphic-uming ibus-table-quick-classic fonts-noto-cjk-extra \
-ibus-chewing libreoffice-help-zh-cn language-pack-gnome-zh-hant \
-thunderbird-locale-zh-cn thunderbird-locale-zh-tw
-apt install -y $(check-language-support)
+apt-get -y autoremove
+apt-get -y clean
+apt-get -y autoclean
+CHROOT
 
-# Install Chromium RKMPP local packages and resolve dependencies with APT
-if compgen -G "/tmp/chromium-rkmpp-deb-bundle/*.deb" > /dev/null; then
-    apt-get install -y /tmp/chromium-rkmpp-deb-bundle/*.deb
-    systemctl enable chromium-rkmpp-nodes.service
-fi
+# Boot into the graphical target with lightdm
+chroot ${chroot_dir} /bin/bash -c \
+    "systemctl enable lightdm > /dev/null && systemctl set-default graphical.target > /dev/null"
 
-# Remove cloud-init and landscape-common
-apt-get -y purge cloud-init landscape-common cryptsetup-initramfs
-
-# Clean package cache
-apt-get -y autoremove && apt-get -y clean && apt-get -y autoclean
-EOF
-
-# Remove staged Chromium RKMPP packages from the rootfs
-rm -rf ${chromium_rkmpp_chroot_dir}
-
-# Hack for GDM to restart on first HDMI hotplug
-mkdir -p ${chroot_dir}/usr/lib/scripts
-cp ${overlay_dir}/usr/lib/scripts/gdm-hack.sh ${chroot_dir}/usr/lib/scripts/gdm-hack.sh
-cp ${overlay_dir}/etc/udev/rules.d/99-gdm-hack.rules ${chroot_dir}/etc/udev/rules.d/99-gdm-hack.rules
-
-# Config file for mpv
-cp ${overlay_dir}/etc/mpv/mpv.conf ${chroot_dir}/etc/mpv/mpv.conf
-
-# Use mpv as the default video player
-sed -i 's/org\.gnome\.Totem\.desktop/mpv\.desktop/g' ${chroot_dir}/usr/share/applications/gnome-mimeapps.list
-
-# Adjust hosts file for desktop
-sed -i 's/127.0.0.1 localhost/127.0.0.1\tlocalhost.localdomain\tlocalhost\n::1\t\tlocalhost6.localdomain6\tlocalhost6/g' ${chroot_dir}/etc/hosts
-sed -i 's/::1 ip6-localhost ip6-loopback/::1     localhost ip6-localhost ip6-loopback/g' ${chroot_dir}/etc/hosts
-sed -i "/ff00::0 ip6-mcastprefix\b/d" ${chroot_dir}/etc/hosts
-
-# Config file for xorg
-mkdir -p ${chroot_dir}/etc/X11/xorg.conf.d
-cp ${overlay_dir}/etc/X11/xorg.conf.d/20-modesetting.conf ${chroot_dir}/etc/X11/xorg.conf.d/20-modesetting.conf
-
-# Networking interfaces
-cp ${overlay_dir}/etc/NetworkManager/NetworkManager.conf ${chroot_dir}/etc/NetworkManager/NetworkManager.conf
-cp ${overlay_dir}/usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf ${chroot_dir}/usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf
-cp ${overlay_dir}/usr/lib/NetworkManager/conf.d/10-override-wifi-random-mac-disable.conf ${chroot_dir}/usr/lib/NetworkManager/conf.d/10-override-wifi-random-mac-disable.conf
-cp ${overlay_dir}/usr/lib/NetworkManager/conf.d/20-override-wifi-powersave-disable.conf ${chroot_dir}/usr/lib/NetworkManager/conf.d/20-override-wifi-powersave-disable.conf
-
-# Ubuntu desktop uses a diffrent network manager, so remove this systemd override
-rm -rf ${chroot_dir}/etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
-
-# Enable wayland session
-cp ${overlay_dir}/etc/gdm3/custom.conf ${chroot_dir}/etc/gdm3/custom.conf
-
-# Use the isolated Mesa 26.2.3 build for desktop and GDM
-cat ${overlay_dir}/etc/mesa-26.2.3.environment >> ${chroot_dir}/etc/environment
-mkdir -p ${chroot_dir}/etc/systemd/system/gdm3.service.d
-cp ${overlay_dir}/etc/systemd/system/gdm3.service.d/mesa-26.2.3.conf ${chroot_dir}/etc/systemd/system/gdm3.service.d/
-
-# default image background
-rm -rf ${chroot_dir}/usr/share/backgrounds/Jammy-Jellyfish_WP_4096x2304_Grey.png
-mv ${chroot_dir}/usr/share/backgrounds/warty-final-ubuntu.png ${chroot_dir}/usr/share/backgrounds/ubuntu-default-greyscale-wallpaper.png
-cp ${overlay_dir}/warty-final-ubuntu.png ${chroot_dir}/usr/share/backgrounds/warty-final-ubuntu.png
-
-# Change startup logo
-mkdir -p  ${chroot_dir}/usr/share/plymouth/themes/spinner
-cp ${overlay_dir}/bgrt-fallback.png ${chroot_dir}/usr/share/plymouth/themes/spinner/bgrt-fallback.png
-cp ${overlay_dir}/ubuntu-logo.png ${chroot_dir}/usr/share/plymouth/ubuntu-logo.png
-cp ${overlay_dir}/ubuntu-logo-icon.png ${chroot_dir}/usr/share/pixmaps/ubuntu-logo-icon.png
-
-# Have plymouth use the framebuffer
-mkdir -p ${chroot_dir}/etc/initramfs-tools/conf-hooks.d
-cp ${overlay_dir}/etc/initramfs-tools/conf-hooks.d/plymouth ${chroot_dir}/etc/initramfs-tools/conf-hooks.d/plymouth
-
-# Fixes serial port input being blocked by Plymouth when there is no HDMI port.
-mkdir -p ${chroot_dir}/etc/systemd/system/plymouth-quit-wait.service.d
-cp ${overlay_dir}/etc/systemd/system/plymouth-quit-wait.service.d/check-hdmi.conf ${chroot_dir}/etc/systemd/system/plymouth-quit-wait.service.d/check-hdmi.conf
-mkdir -p ${chroot_dir}/usr/local/bin
-cp ${overlay_dir}/usr/local/bin/check-hdmi-plymouth.sh ${chroot_dir}/usr/local/bin/check-hdmi-plymouth.sh
-
-# Fix 24.04 audio renaming issue
-mkdir -p ${chroot_dir}/etc/wireplumber/main.lua.d/
-cp ${overlay_dir}/etc/wireplumber/main.lua.d/51-alsa-custom.lua ${chroot_dir}/etc/wireplumber/main.lua.d/51-alsa-custom.lua
-
-# Fix AppArmor who command language file access
-mkdir -p ${chroot_dir}/etc/apparmor.d/
-cp ${overlay_dir}/etc/apparmor.d/who ${chroot_dir}/etc/apparmor.d/who
-
-# Update initramfs
+# Rebuild initramfs (GPU/audio firmware)
 chroot ${chroot_dir} /bin/bash -c "update-initramfs -u"
 
-# Umount the temporary API filesystems
+# Let systemd generate the machine-id on first boot
+rm -f ${chroot_dir}/var/lib/dbus/machine-id
+true > ${chroot_dir}/etc/machine-id
+
+# Umount temporary API filesystems
 umount -lf ${chroot_dir}/dev/pts 2> /dev/null || true
 umount -lf ${chroot_dir}/* 2> /dev/null || true
 
-# Tar the entire rootfs
-cd ${chroot_dir} && XZ_OPT="-3 -T0" tar -cpJf ../ubuntu-26.04-desktop-arm64.rootfs.tar.xz . && cd ..
+echo "==> Packing ${desktop_rootfs}"
+cd ${chroot_dir} && XZ_OPT="-3 -T0" tar -cpJf ../${desktop_rootfs} . && cd ..
+
+exit 0
